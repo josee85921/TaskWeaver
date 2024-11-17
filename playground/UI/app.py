@@ -1,3 +1,4 @@
+import atexit
 import functools
 import os
 import re
@@ -31,6 +32,7 @@ from taskweaver.session.session import Session
 
 project_path = os.path.join(repo_path, "project")
 app = TaskWeaverApp(app_dir=project_path, use_local_uri=True)
+atexit.register(app.stop)
 app_session_dict: Dict[str, Session] = {}
 
 
@@ -128,6 +130,7 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
     def __init__(self, root_step: cl.Step):
         self.root_step = root_step
         self.reset_cur_step()
+        self.suppress_blinking_cursor()
 
     def reset_cur_step(self):
         self.cur_step: Optional[cl.Step] = None
@@ -137,6 +140,11 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
         self.cur_message: str = ""
         self.cur_message_is_end: bool = False
         self.cur_message_sent: bool = False
+
+    def suppress_blinking_cursor(self):
+        cl.run_sync(self.root_step.stream_token(""))
+        if self.cur_step is not None:
+            cl.run_sync(self.cur_step.stream_token(""))
 
     def handle_round(
         self,
@@ -207,6 +215,7 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
                     ),
                 ]
                 cl.run_sync(self.cur_step.update())
+        self.suppress_blinking_cursor()
 
     def get_message_from_user(self, prompt: str, timeout: int = 120) -> Optional[str]:
         ask_user_msg = cl.AskUserMessage(content=prompt, author=" ", timeout=timeout)
@@ -252,7 +261,7 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
                 continue
 
             # skip Python in final result
-            if is_end and a_type in [AttachmentType.python]:
+            if is_end and a_type in [AttachmentType.reply_content]:
                 continue
 
             content_chunks.append(self.format_attachment(attachment))
@@ -316,7 +325,7 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
                     elem("code")(txt(msg)),
                 ),
             )
-        elif a_type in [AttachmentType.python, AttachmentType.sample]:
+        elif a_type in [AttachmentType.reply_content]:
             atta_cnt.append(
                 elem("pre", "tw-python", {"data-lang": "python"})(
                     elem("code", "language-python")(txt(msg, br=False)),
@@ -372,18 +381,7 @@ class ChainLitMessageUpdater(SessionEventHandlerBase):
 async def start():
     user_session_id = cl.user_session.get("id")
     app_session_dict[user_session_id] = app.get_session()
-    exec_kernel_mode = app_session_dict[user_session_id].code_executor.get_execution_mode()
-    print(f"Starting session in `{exec_kernel_mode}` mode")
-    if exec_kernel_mode == "local":
-        print(
-            "Code running in local mode "
-            "may incur security risks, such as file system access. "
-            "Please be cautious when executing code. "
-            "For higher security, consider using the `container` mode by setting "
-            "the `execution_service.kernel_mode` to `container`. "
-            "For more information, please refer to the documentation ("
-            "https://microsoft.github.io/TaskWeaver/docs/code_execution).",
-        )
+    print("Starting new session")
 
 
 @cl.on_chat_end

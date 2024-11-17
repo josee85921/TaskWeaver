@@ -1,6 +1,11 @@
-from typing import Literal, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional, ParamSpec, TypeVar
 
 from injector import inject
+
+if TYPE_CHECKING:
+    from opentelemetry.util import types
 
 from taskweaver.config.module_config import ModuleConfig
 
@@ -9,14 +14,18 @@ class TracingConfig(ModuleConfig):
     def _configure(self):
         self._set_name("tracing")
         self.enabled = self._get_bool("enabled", False)
-        self.endpoint = self._get_str("endpoint", "http://127.0.0.1:4318/v1/traces")
+        self.endpoint = self._get_str("endpoint", "http://127.0.0.1:4317")
         self.service_name = self._get_str("service_name", "taskweaver.otlp.tracer")
         self.exporter = self._get_str("exporter", "otlp")
+        self.tokenizer_target_model = self._get_str("tokenizer_target_model", "gpt-4")
 
 
 _tracer = None
 _trace = None
 _StatusCode = None
+_meter = None
+_counters: Dict[str, Any] = {}
+_enc = None
 
 
 class Tracing:
@@ -25,7 +34,7 @@ class Tracing:
         self,
         config: TracingConfig,
     ):
-        global _tracer, _trace, _StatusCode
+        global _tracer, _trace, _StatusCode, _meter, _enc, _counters
 
         self.config = config
         if not self.config.enabled:
@@ -35,18 +44,24 @@ class Tracing:
             return
 
         try:
-            from opentelemetry import trace
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            import tiktoken
+            from opentelemetry import metrics, trace
+            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
             from opentelemetry.sdk.resources import SERVICE_NAME, Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
             from opentelemetry.trace import StatusCode
+
         except ImportError:
             raise ImportError(
                 "Please install opentelemetry-sdk, "
                 "opentelemetry-api, "
                 "opentelemetry-exporter-otlp, "
                 "opentelemetry-instrumentation, "
+                "tiktoken "
                 "first.",
             )
 
@@ -56,27 +71,45 @@ class Tracing:
             },
         )
 
-        provider = TracerProvider(resource=resource)
+        trace_provider = TracerProvider(resource=resource)
 
         if self.config.exporter == "otlp":
-            exporter = OTLPSpanExporter(endpoint=self.config.endpoint)
+            trace_exporter = OTLPSpanExporter(endpoint=self.config.endpoint)
+            metrics_exporter = OTLPMetricExporter(endpoint=self.config.endpoint)
         elif self.config.exporter == "console":
-            exporter = ConsoleSpanExporter()
+            trace_exporter = ConsoleSpanExporter()
+            metrics_exporter = ConsoleMetricExporter()
         else:
             raise ValueError(f"Unknown exporter: {self.config.exporter}")
 
-        processor = BatchSpanProcessor(exporter)
-        provider.add_span_processor(processor)
+        processor = BatchSpanProcessor(trace_exporter)
+        trace_provider.add_span_processor(processor)
 
         # Sets the global default tracer provider
-        trace.set_tracer_provider(provider)
+        trace.set_tracer_provider(trace_provider)
 
         _tracer = trace.get_tracer(__name__)
         _trace = trace
         _StatusCode = StatusCode
 
+        metric_reader = PeriodicExportingMetricReader(metrics_exporter)
+        meter_provider = MeterProvider(
+            resource=resource,
+            metric_readers=[metric_reader],
+        )
+        metrics.set_meter_provider(meter_provider)
+
+        _meter = metrics.get_meter(__name__)
+        _counters["prompt_size"] = _meter.create_counter(
+            "prompt_size",
+            unit="1",
+            description="Counts the number of tokens in the prompt.",
+        )
+        # To get the tokeniser corresponding to a specific model in the OpenAI API:
+        _enc = tiktoken.encoding_for_model(self.config.tokenizer_target_model)
+
+    @staticmethod
     def set_span_status(
-        self,
         status_code: Literal["OK", "ERROR"],
         status_message: Optional[str] = None,
     ):
@@ -89,19 +122,38 @@ class Tracing:
             status_message = None
         span.set_status(status_code, status_message)
 
-    def set_span_attribute(self, key, value):
+    @staticmethod
+    def set_span_attribute(key: str, value: types.AttributeValue):
         if _trace is None:
             return
 
         span = _trace.get_current_span()
         span.set_attribute(key, value)
 
-    def set_span_exception(self, exception):
+    @staticmethod
+    def set_span_exception(exception: Exception):
         if _trace is None:
             return
 
         span = _trace.get_current_span()
         span.record_exception(exception)
+
+    @staticmethod
+    def add_prompt_size(size: int = 0, labels: Optional[Dict[str, str]] = None):
+        if _meter is None:
+            return
+
+        _counters["prompt_size"].add(
+            size,
+            labels or {},
+        )
+
+    @staticmethod
+    def count_tokens(data: str) -> int:
+        if _enc is None:
+            return 0
+
+        return len(_enc.encode(data))
 
 
 class DummyTracer:
@@ -124,27 +176,48 @@ class DummyTracer:
         pass
 
 
-def tracing_decorator_non_class(func):
-    def wrapper(*args, **kwargs):
-        if _tracer is None:
-            return func(*args, **kwargs)
+TracingResultVar = TypeVar("TracingResultVar")
 
-        with _tracer.start_as_current_span(func.__name__):
-            result = func(*args, **kwargs)
-        return result
+
+def _tracing_decorator_inner(
+    func: Callable[[], TracingResultVar],
+    span_name: str,
+) -> TracingResultVar:
+    if _tracer is None:
+        return func()
+    with _tracer.start_as_current_span(span_name):
+        return func()
+
+
+TracingDecParam = ParamSpec("TracingDecParam")
+TracingDecRetType = TypeVar("TracingDecRetType")
+
+
+def tracing_decorator_non_class(
+    func: Callable[TracingDecParam, TracingDecRetType],
+) -> Callable[TracingDecParam, TracingDecRetType]:
+    def wrapper(
+        *args: TracingDecParam.args,
+        **kwargs: TracingDecParam.kwargs,
+    ) -> TracingDecRetType:
+        span_name = func.__name__
+        return _tracing_decorator_inner(lambda: func(*args, **kwargs), span_name)
 
     return wrapper
 
 
-def tracing_decorator(func):
-    def wrapper(self, *args, **kwargs):
-        if _tracer is None:
-            return func(self, *args, **kwargs)
-
-        span_name = f"{self.__class__.__name__}.{func.__name__}"
-        with _tracer.start_as_current_span(span_name):
-            result = func(self, *args, **kwargs)
-        return result
+def tracing_decorator(
+    func: Callable[TracingDecParam, TracingDecRetType],
+) -> Callable[TracingDecParam, TracingDecRetType]:
+    def wrapper(
+        *args: TracingDecParam.args,
+        **kwargs: TracingDecParam.kwargs,
+    ) -> TracingDecRetType:
+        class_name = ""
+        if len(args) > 0 and hasattr(args[0], "__class__"):
+            class_name = args[0].__class__.__name__
+        span_name = f"{class_name}.{func.__name__}"
+        return _tracing_decorator_inner(lambda: func(*args, **kwargs), span_name)
 
     return wrapper
 
